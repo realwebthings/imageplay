@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Shrink PNGs without changing how they look.
+"""Shrink images without changing how they look.
+
+Handles PNG, JPEG, WebP and AVIF, and can convert any of them to WebP or AVIF.
+The format is read from the file's magic bytes rather than its name, so a
+JPEG called .png is treated as the JPEG it is.
 
 Why this exists
 ---------------
@@ -111,6 +115,27 @@ or past the error budget, are refused individually -- one being rejected says
 nothing about the rest. --all IS the variant choice, so combining it with
 --lossy, --drop-opaque-alpha or --suffix is an error rather than a refinement.
 
+Formats other than PNG
+----------------------
+JPEG, WebP and AVIF have no bit depth to reduce and no chunks to splice, so
+they get the dial they do have -- quality -- plus a metadata strip:
+
+    --quality Q     re-encode at quality Q (1-100)
+    --to FORMAT     convert to webp, avif, png or jpg
+
+``--all`` on such a source offers a stripped copy, three quality levels, and
+WebP/AVIF conversions. Two things are worth knowing:
+
+* A "strip only" pass must not touch pixels, which ImageMagick cannot promise
+  for these formats -- it re-encodes. JPEG therefore goes through ``jpegtran``
+  when it is installed (lossless, MAE 0, and a few percent smaller again);
+  WebP is written with ``webp:lossless=true``, which is honest but usually
+  larger than the source, so the size guard declines it.
+* JPEG cannot store transparency. Encoding an image with a real alpha channel
+  to JPEG flattens it against black with no warning at all, so that is refused
+  rather than done. A uniformly opaque alpha channel holds nothing and is not
+  in the way.
+
 Going further than lossless (both off by default):
 
     --drop-opaque-alpha   discard an alpha channel that is fully opaque. Still
@@ -160,17 +185,46 @@ CRITICAL_CHUNKS = {"IHDR", "PLTE", "IDAT", "IEND", "tRNS", "cICP", "sRGB", "gAMA
 # actually recovers something. Below this, the rewrite is not worth the churn.
 MIN_METADATA_STRIP = 8 * 1024
 
-# What --all produces, in descending fidelity. The first two are pixel-exact;
-# the quantised three trade accuracy for size, so they are named by their
-# colour count and the caller picks a rung by looking at the sizes.
+# What --all produces for a PNG source, in descending fidelity. The first two
+# are pixel-exact; the quantised three trade accuracy for size, so they are
+# named by their colour count and the caller picks a rung from the sizes.
 # (suffix, drop_alpha, colors)
-ALL_VARIANTS = (
+PNG_VARIANTS = (
     ("-lossless", False, None),
     ("-noalpha", True, None),
     ("-lossy256", False, 256),
     ("-lossy128", False, 128),
     ("-lossy64", False, 64),
 )
+
+# JPEG and WebP have no lossless rung to offer: re-encoding always resamples,
+# so the ladder is quality levels rather than colour counts. Stripping
+# metadata is the one step that leaves pixels alone.
+# (suffix, quality) -- quality None means "strip only, keep the pixel data"
+QUALITY_VARIANTS = (
+    ("-stripped", None),
+    ("-q90", 90),
+    ("-q82", 82),
+    ("-q75", 75),
+)
+
+# Modern formats, offered alongside whatever the source was. These change the
+# format rather than shrinking it in place, so they are always additional
+# files and never replace the original.
+# (suffix, format, quality)
+MODERN_VARIANTS = (
+    ("-webp", "webp", 82),
+    ("-avif", "avif", 50),
+)
+
+# Formats the script will read and re-encode. Anything else is refused rather
+# than guessed at.
+SUPPORTED_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".avif")
+
+# Formats that cannot store an alpha channel. Encoding an image with real
+# transparency to one of these silently flattens it against black -- no error,
+# no warning, just a ruined image -- so it is refused instead.
+OPAQUE_ONLY_FORMATS = {"jpg", "jpeg"}
 
 
 class Ihdr:
@@ -287,6 +341,50 @@ def alpha_is_fully_opaque(binary: str, path: str) -> bool:
     return low == high and high in (1.0, 255.0, 65535.0)
 
 
+def source_format(path: str) -> str | None:
+    """The image format of `path`, by content rather than by name.
+
+    A file called .png that is really a JPEG must be treated as a JPEG, so the
+    magic bytes decide. Returns None for anything unsupported.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+    except OSError:
+        return None
+    if head.startswith(PNG_SIGNATURE):
+        return "png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    # AVIF and HEIC share the ISO-BMFF container: 4-byte size, then 'ftyp',
+    # then a brand that says which it is.
+    if head[4:8] == b"ftyp" and head[8:12] in (b"avif", b"avis", b"mif1", b"msf1"):
+        return "avif"
+    return None
+
+
+def image_has_alpha(binary: str, path: str) -> bool:
+    """Whether the image carries an alpha channel with anything in it.
+
+    Used to refuse encoding real transparency into a format that cannot hold
+    it. On any doubt this answers True, because wrongly believing an image is
+    opaque is what silently destroys it.
+    """
+    cmd = [binary] if binary == "magick" else ["identify"]
+    if binary == "magick":
+        cmd.append("identify")
+    cmd += ["-format", "%A", path]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return True
+    if proc.stdout.strip().lower() in ("false", "undefined"):
+        return False
+    # The channel exists; a uniformly opaque one still holds nothing.
+    return not alpha_is_fully_opaque(binary, path)
+
+
 def require_imagemagick() -> str:
     """Return the ImageMagick binary name, or exit with install instructions.
 
@@ -363,7 +461,9 @@ def mean_absolute_error(binary: str, a: str, b: str) -> float:
     return float(match.group(1)) if match else float("nan")
 
 
-def destination_for(path: str, out: str | None, suffix: str | None, many: bool) -> str:
+def destination_for(
+    path: str, out: str | None, suffix: str | None, many: bool, ext: str | None = None
+) -> str:
     """Where the result for `path` should land.
 
     With neither --out nor --suffix this is `path` itself, i.e. in-place.
@@ -374,15 +474,16 @@ def destination_for(path: str, out: str | None, suffix: str | None, many: bool) 
     build the first time it is run. The extension is the one signal the caller
     actually controls.
     """
-    name = os.path.basename(path)
-    if suffix:
-        stem, ext = os.path.splitext(name)
-        name = f"{stem}{suffix}{ext}"
+    stem, current_ext = os.path.splitext(os.path.basename(path))
+    # `ext` overrides the source's own when a variant changes format, so a PNG
+    # converted to WebP lands as logo-webp.webp rather than logo-webp.png.
+    final_ext = ext or current_ext
+    name = f"{stem}{suffix}{final_ext}" if suffix else f"{stem}{final_ext}"
 
     if not out:
         return os.path.join(os.path.dirname(path), name)
 
-    if out.lower().endswith(".png") and not out.endswith(os.sep):
+    if out.lower().endswith(SUPPORTED_SUFFIXES) and not out.endswith(os.sep):
         if many:
             # Several inputs cannot share one filename; they would overwrite
             # each other in turn and only the last would survive.
@@ -396,6 +497,116 @@ def destination_for(path: str, out: str | None, suffix: str | None, many: bool) 
 
 def kb(num_bytes: int) -> str:
     return f"{num_bytes / 1024:.1f}KB"
+
+
+def process_encoded(
+    path: str,
+    binary: str,
+    tmp_dir: str,
+    index: int,
+    opts,
+    suffix: str,
+    quality: int | None,
+    out_format: str | None,
+    many: bool,
+) -> int | None:
+    """Produce one variant of an already-compressed source (JPEG/WebP/AVIF).
+
+    None of the PNG chunk work applies here: these formats have no bit depth
+    to reduce and no ancillary chunks to splice. What they do have is
+    metadata worth stripping and a quality dial, plus -- via `out_format` --
+    the option of re-encoding to something more modern.
+
+    Returns bytes saved, or None when the file was left alone.
+    """
+    src_format = source_format(path)
+    target = out_format or src_format
+    if target is None:
+        print(f"skip  {path} — unsupported format")
+        return None
+
+    # Encoding real transparency to a format that cannot hold it flattens it
+    # against black with no warning at all, so it is refused rather than done.
+    if target in OPAQUE_ONLY_FORMATS and image_has_alpha(binary, path):
+        print(f"SKIP  {path} [{suffix.lstrip('-')}] — {target} cannot store transparency")
+        return None
+
+    before = os.path.getsize(path)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    out = os.path.join(tmp_dir, f"{index}{suffix}-{stem}.{target}")
+
+    if quality is None and target == src_format == "jpg" and shutil.which("jpegtran"):
+        # ImageMagick cannot strip a JPEG without re-encoding it (MAE ~0.0002),
+        # so a genuinely lossless pass needs jpegtran, which rearranges the
+        # existing coefficients instead of resampling them. -progressive
+        # typically saves a few percent more, still at MAE 0.
+        proc = subprocess.run(
+            ["jpegtran", "-copy", "none", "-progressive", "-optimize",
+             "-outfile", out, path],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or "").strip().splitlines()
+            print(f"SKIP  {path} — jpegtran failed: {detail[-1] if detail else 'error'}")
+            return None
+    else:
+        argv = [path, "-strip"]
+        if quality is not None:
+            argv += ["-quality", str(quality)]
+        elif target == "webp":
+            # Re-encoding a WebP without saying otherwise is lossy, which a
+            # "strip only" pass must not be.
+            argv += ["-define", "webp:lossless=true"]
+        argv.append(out)
+
+        error = run_convert(binary, argv)
+        if error is not None:
+            print(f"SKIP  {path} — convert failed: {error}")
+            return None
+
+    after = os.path.getsize(out)
+    mae = mean_absolute_error(binary, path, out)
+
+    # A strip-only pass must not touch pixels; a quality pass is expected to,
+    # and is bounded by the same budget the PNG ladder uses for quantisation.
+    limit = MAX_MAE if quality is None else opts.max_lossy_mae
+    if not (mae == mae) or mae > limit:
+        reported = "unreadable" if mae != mae else mae
+        print(
+            f"SKIP  {path} [{suffix.lstrip('-')}] — refusing to write "
+            f"(MAE={reported} > {limit})"
+        )
+        return None
+
+    if after >= before:
+        print(
+            f"ok    {path} [{suffix.lstrip('-')}] — result is larger "
+            f"({kb(before)} -> {kb(after)}), leaving as is"
+        )
+        return None
+
+    dest = destination_for(path, opts.out, suffix, many, ext=f".{target}")
+    pct = (before - after) / before * 100
+    notes = []
+    if quality is None:
+        notes.append("metadata stripped, pixels untouched")
+    else:
+        notes.append(f"quality {quality}")
+    if out_format:
+        notes.append(f"converted to {out_format}")
+    verb = "WROTE" if opts.write else "would"
+    print(
+        f"{verb} {path} -> {dest} — {kb(before)} -> {kb(after)} "
+        f"(-{pct:.0f}%, MAE {mae}, {', '.join(notes)})"
+    )
+
+    if opts.write:
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        shutil.copyfile(out, dest)
+    return before - after
 
 
 def process(
@@ -589,37 +800,51 @@ def process(
     return before - after
 
 
-VARIANT_MENU = (
+PNG_MENU = (
     ("all", "every variant below, to compare"),
     ("lossless", "8-bit, metadata stripped -- pixel-identical"),
     ("noalpha", "also drop a fully-opaque alpha channel -- pixel-identical"),
     ("lossy256", "quantise to 256 colours -- changes pixels"),
     ("lossy128", "quantise to 128 colours -- changes pixels"),
     ("lossy64", "quantise to 64 colours -- changes pixels"),
+    ("webp", "convert to WebP -- usually far smaller"),
+    ("avif", "convert to AVIF -- smaller still"),
+)
+
+# Bit depth and colour counts mean nothing to an already-compressed source,
+# so it gets the dial it actually has: quality.
+ENCODED_MENU = (
+    ("all", "every variant below, to compare"),
+    ("stripped", "remove metadata, keep the pixels -- lossless"),
+    ("q90", "re-encode at quality 90 -- changes pixels"),
+    ("q82", "re-encode at quality 82 -- changes pixels"),
+    ("q75", "re-encode at quality 75 -- changes pixels"),
+    ("webp", "convert to WebP"),
+    ("avif", "convert to AVIF -- usually smallest"),
 )
 
 
-def ask_variant() -> str | None:
-    """Ask which variant to generate. Returns a VARIANT_MENU key, or None.
+def ask_variant(menu) -> str | None:
+    """Ask which variant to generate. Returns a menu key, or None.
 
     Only ever called on a terminal -- a piped or scripted run must not block
     waiting for an answer nobody is there to give.
     """
     print("Which variant would you like?\n")
-    for number, (key, blurb) in enumerate(VARIANT_MENU, 1):
+    for number, (key, blurb) in enumerate(menu, 1):
         print(f"  {number}. {key:<9} {blurb}")
     print()
     try:
-        reply = input("Choose 1-6 [1]: ").strip()
+        reply = input(f"Choose 1-{len(menu)} [1]: ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return None
     if not reply:
         return "all"
-    if reply.isdigit() and 1 <= int(reply) <= len(VARIANT_MENU):
-        return VARIANT_MENU[int(reply) - 1][0]
+    if reply.isdigit() and 1 <= int(reply) <= len(menu):
+        return menu[int(reply) - 1][0]
     # Accept the name as readily as the number; it is what the menu shows.
-    for key, _ in VARIANT_MENU:
+    for key, _ in menu:
         if reply.lower() == key:
             return key
     print(f"'{reply}' is not one of the choices.")
@@ -681,6 +906,25 @@ def main() -> int:
         help="reject a --lossy result above this error (default: 0.02)",
     )
     parser.add_argument(
+        "--quality",
+        type=int,
+        metavar="Q",
+        help=(
+            "re-encode a JPEG/WebP/AVIF at quality Q (1-100). These formats have "
+            "no lossless rung: re-encoding always resamples. Omit it to strip "
+            "metadata and leave the pixels alone"
+        ),
+    )
+    parser.add_argument(
+        "--to",
+        metavar="FORMAT",
+        choices=("webp", "avif", "png", "jpg"),
+        help=(
+            "convert to FORMAT (webp, avif, png, jpg) instead of keeping the "
+            "source's own. Written as a new file; the source is untouched"
+        ),
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
         help=(
@@ -694,6 +938,9 @@ def main() -> int:
     if opts.lossy is not None and opts.lossy < 2:
         parser.error("--lossy needs at least 2 colours")
 
+    if opts.quality is not None and not 1 <= opts.quality <= 100:
+        parser.error("--quality takes 1-100")
+
     # --all IS the variant selection, so a flag that also selects one is a
     # contradiction rather than a refinement. Failing beats silently ignoring.
     if opts.all:
@@ -701,6 +948,8 @@ def main() -> int:
             name
             for name, value in (
                 ("--lossy", opts.lossy is not None),
+                ("--quality", opts.quality is not None),
+                ("--to", bool(opts.to)),
                 ("--drop-opaque-alpha", opts.drop_opaque_alpha),
                 ("--suffix", bool(opts.suffix)),
             )
@@ -723,13 +972,22 @@ def main() -> int:
     chose_variant = (
         opts.all
         or opts.lossy is not None
+        or opts.quality is not None
+        or opts.to
         or opts.drop_opaque_alpha
         or opts.write
         or opts.out
     )
     if opts.paths and not chose_variant and not opts.suffix:
+        # The menu has to match what the source can actually do, so it is
+        # chosen from the first real image among the inputs.
+        first = next(
+            (p for p in opts.paths if os.path.isfile(p) and source_format(p)), None
+        )
+        menu = PNG_MENU if (first and source_format(first) == "png") else ENCODED_MENU
+
         if sys.stdin.isatty() and sys.stdout.isatty():
-            choice = ask_variant()
+            choice = ask_variant(menu)
             if choice is None:
                 return 1
         else:
@@ -737,12 +995,21 @@ def main() -> int:
 
         if choice == "all":
             opts.all = True
+        elif choice in ("webp", "avif"):
+            opts.to = choice
+            opts.quality = 82 if choice == "webp" else 50
+            opts.suffix = opts.suffix or f"-{choice}"
         elif choice == "noalpha":
             opts.drop_opaque_alpha = True
             opts.suffix = opts.suffix or "-noalpha"
         elif choice.startswith("lossy"):
             opts.lossy = int(choice.removeprefix("lossy"))
             opts.suffix = opts.suffix or f"-{choice}"
+        elif choice.startswith("q"):
+            opts.quality = int(choice.removeprefix("q"))
+            opts.suffix = opts.suffix or f"-{choice}"
+        elif choice == "stripped":
+            opts.suffix = opts.suffix or "-stripped"
         else:
             opts.suffix = opts.suffix or "-lossless"
 
@@ -771,7 +1038,7 @@ def main() -> int:
             pngs.extend(
                 os.path.join(target, name)
                 for name in os.listdir(target)
-                if name.lower().endswith(".png")
+                if name.lower().endswith(SUPPORTED_SUFFIXES)
             )
         elif os.path.isfile(target):
             # Named explicitly, so process it whatever the extension says --
@@ -811,11 +1078,38 @@ def main() -> int:
                 # attempt, and one being refused says nothing about the rest.
                 produced = 0
                 best_saved = 0
-                for suffix, drop_alpha, colors in ALL_VARIANTS:
-                    saved = process(
-                        path, binary, tmp_dir, index, opts,
-                        suffix, drop_alpha, colors, many=True,
+                fmt = source_format(path)
+
+                # The in-format ladder depends on what the source is: a PNG
+                # has bit depth and a palette to play with, while an already
+                # compressed format only has metadata and a quality dial.
+                if fmt == "png":
+                    attempts = [
+                        lambda sfx=sfx, da=da, col=col: process(
+                            path, binary, tmp_dir, index, opts, sfx, da, col, many=True
+                        )
+                        for sfx, da, col in PNG_VARIANTS
+                    ]
+                else:
+                    attempts = [
+                        lambda sfx=sfx, q=q: process_encoded(
+                            path, binary, tmp_dir, index, opts, sfx, q, None, many=True
+                        )
+                        for sfx, q in QUALITY_VARIANTS
+                    ]
+
+                # Modern formats are offered for every source, since that is
+                # usually where the real saving is.
+                attempts += [
+                    lambda sfx=sfx, f=f, q=q: process_encoded(
+                        path, binary, tmp_dir, index, opts, sfx, q, f, many=True
                     )
+                    for sfx, f, q in MODERN_VARIANTS
+                    if f != fmt
+                ]
+
+                for attempt in attempts:
+                    saved = attempt()
                     if saved is not None:
                         produced += 1
                         # These variants are alternatives to each other, not
@@ -829,10 +1123,20 @@ def main() -> int:
                     skipped += 1
                 continue
 
-            saved = process(
-                path, binary, tmp_dir, index, opts,
-                opts.suffix, opts.drop_opaque_alpha, opts.lossy, many=len(pngs) > 1,
-            )
+            # --to always means a format change, which is process_encoded's
+            # job whatever the source happens to be.
+            if source_format(path) == "png" and not opts.to:
+                saved = process(
+                    path, binary, tmp_dir, index, opts,
+                    opts.suffix, opts.drop_opaque_alpha, opts.lossy, many=len(pngs) > 1,
+                )
+            else:
+                # --lossy names a colour count, which means nothing to a JPEG;
+                # --quality is the dial these formats actually have.
+                saved = process_encoded(
+                    path, binary, tmp_dir, index, opts,
+                    opts.suffix or "", opts.quality, opts.to, many=len(pngs) > 1,
+                )
             if saved is None:
                 skipped += 1
             else:

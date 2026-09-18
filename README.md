@@ -1,6 +1,8 @@
 # compress_image.py
 
-Shrink PNGs without changing how they look.
+Shrink images without changing how they look.
+
+Handles **PNG, JPEG, WebP and AVIF**, and converts any of them to WebP or AVIF.
 
 Most design tools export PNGs at 16 bits per channel. That is 8 bytes per pixel
 — twice what any logo, icon or social card needs. A 512×514 logo exported this
@@ -57,6 +59,7 @@ Outside that prompt the old rule still holds: nothing is written without
 ## Install
 
 Python 3.10+ (the script uses `X | None` type syntax) and ImageMagick.
+Optionally `jpegtran` (part of libjpeg-turbo) for lossless JPEG stripping.
 
 ```bash
 # macOS
@@ -99,6 +102,55 @@ whatever its extension, because the PNG header is checked anyway.
 | `--lossy [COLORS]` | Quantise to `COLORS` colours (default 256). **Changes pixels.** |
 | `--max-lossy-mae MAE` | Error budget for `--lossy`. Default `0.02`. |
 | `--all` | Generate every variant as a separate file. Never overwrites the source. |
+| `--quality Q` | Re-encode a JPEG/WebP/AVIF at quality `Q` (1-100). |
+| `--to FORMAT` | Convert to `webp`, `avif`, `png` or `jpg`. Written as a new file. |
+
+## Other formats
+
+The format is read from the file's magic bytes, not its name — a JPEG called
+`.png` is treated as the JPEG it is, and an unrecognised file is skipped rather
+than guessed at.
+
+JPEG, WebP and AVIF have no bit depth to reduce and no chunks to splice, so they
+get the dial they do have — quality — plus a metadata strip. `--all` on a JPEG:
+
+```
+would photo.jpg -> photo-stripped.jpg — 480.2KB -> 461.3KB (-4%, MAE 0.0, metadata stripped, pixels untouched)
+would photo.jpg -> photo-q90.jpg      — 480.2KB -> 372.4KB (-22%, MAE 0.007, quality 90)
+would photo.jpg -> photo-q82.jpg      — 480.2KB -> 253.5KB (-47%, MAE 0.009, quality 82)
+would photo.jpg -> photo-q75.jpg      — 480.2KB -> 205.3KB (-57%, MAE 0.011, quality 75)
+would photo.jpg -> photo-webp.webp    — 480.2KB -> 148.0KB (-69%, MAE 0.010, converted to webp)
+would photo.jpg -> photo-avif.avif    — 480.2KB ->  65.9KB (-86%, MAE 0.014, converted to avif)
+```
+
+Converting is usually where the real saving is. The same 2624KB PNG from above:
+
+| Variant | Size | Change |
+| --- | --- | --- |
+| `test-lossless.png` | 1786.4KB | -32% |
+| `test-lossy64.png` | 306.0KB | -88% |
+| `test-webp.webp` | 144.1KB | -95% |
+| `test-avif.avif` | 65.5KB | **-98%** |
+
+### Two things worth knowing
+
+**A "strip only" pass must not touch pixels**, which ImageMagick cannot promise
+for these formats — it re-encodes (a plain JPEG strip measures MAE 0.0002, not
+0). JPEG therefore goes through [`jpegtran`](https://linux.die.net/man/1/jpegtran)
+when it is installed, which rearranges the existing coefficients instead of
+resampling them: genuinely lossless, and a few percent smaller again. It is
+optional — without it, the stripped variant is simply skipped. WebP is written
+with `webp:lossless=true`, which is honest but usually *larger* than a lossy
+source, so the size guard declines it.
+
+**JPEG cannot store transparency.** Encoding an image with a real alpha channel
+to JPEG flattens it against black with no warning at all, so the script refuses:
+
+```
+SKIP  logo.png [avif] — jpg cannot store transparency
+```
+
+A uniformly opaque alpha channel holds nothing, so it is not in the way.
 
 ## Generating every variant at once
 
